@@ -262,15 +262,19 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
+        last_hiddens = data.batch["last_hiddens"]
         # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+        advantages, returns, ref_last_hiddens, ref_hidden_flag = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            last_hiddens=last_hiddens,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        data.batch["ref_last_hiddens"] = ref_last_hiddens
+        data.batch["ref_hidden_flag"] = ref_hidden_flag
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1228,6 +1232,7 @@ class RayPPOTrainer:
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
+                        # last_hiddens = old_log_prob.batch["last_hiddens"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
