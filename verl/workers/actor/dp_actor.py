@@ -41,6 +41,105 @@ if is_cuda_available:
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
+import torch.nn.functional as F
+
+
+def get_embs(last_hidden):
+    weights = torch.softmax(last_hidden.mean(dim=-1), dim=-1)
+    return (weights.unsqueeze(-1) * last_hidden).sum(dim=1)
+
+
+def compute_cl_loss(last_hidden, ref_hidden_flag, ref_last_hiddens, progress):
+    assert last_hidden.shape[0] == ref_hidden_flag.shape[0] == ref_last_hiddens.shape[0]
+    base_temp = 0.1
+    min_temp = 0.01
+    hard_ratio = 0.2
+
+    # def get_embs(last_hidden):
+    #     weights = torch.softmax(last_hidden.mean(dim=-1), dim=-1)
+    #     return (weights.unsqueeze(-1) * last_hidden).sum(dim=1)
+
+    def compute_separation_metrics(high_embs, low_embs):
+        # 1. 类内距离
+        high_intra_dist = torch.cdist(high_embs, high_embs).mean()
+        low_intra_dist = torch.cdist(low_embs, low_embs).mean()
+        
+        # 2. 类间距离
+        inter_dist = torch.cdist(high_embs, low_embs).mean()
+        
+        # 3. 分离度分数
+        separation = inter_dist / (0.5*(high_intra_dist + low_intra_dist))
+        
+        return {
+            "intra_high": high_intra_dist.item(),
+            "intra_low": low_intra_dist.item(),
+            "inter": inter_dist.item(),
+            "separation": separation.item()
+        }
+
+    def forward_cl(high_embs, low_embs, progress):
+        """
+        high_embs: [N, D] 高奖励嵌入
+        low_embs: [M, D] 低奖励嵌入
+        progress: 训练进度 (0.0~1.0)
+        """
+        # 1. 温度自适应
+        temp = max(min_temp, base_temp * (1 - progress))
+        
+        # 2. 归一化嵌入
+        high_embs = F.normalize(high_embs, dim=-1)
+        low_embs = F.normalize(low_embs, dim=-1)
+        
+        # 3. 计算相似度矩阵
+        sim_matrix = torch.mm(high_embs, low_embs.t())  # [N, M]
+        
+        # 4. 困难负样本挖掘
+        mask = torch.zeros_like(sim_matrix)
+        if hard_ratio > 0:
+            k = max(1, int(hard_ratio * low_embs.size(0)))
+            _, hard_indices = torch.topk(sim_matrix, k=k, dim=1, largest=True)
+            mask.scatter_(1, hard_indices, 1)
+        
+        # 5. 对比损失计算
+        # print("1===========", high_embs.device, sim_matrix.device)
+        pos_sim = torch.diag(sim_matrix)  # 对角线作为正样本对
+        # print("2===========", pos_sim.device, sim_matrix.device)
+
+        neg_sim = sim_matrix - torch.diag_embed(pos_sim) * torch.eye(sim_matrix.size(0), device=sim_matrix.device)
+        
+        # 应用困难负样本掩码
+        neg_sim = neg_sim * mask
+        
+        # 损失计算
+        numerator = torch.exp(pos_sim / temp)
+        denominator = numerator + torch.sum(torch.exp(neg_sim / temp), dim=1)
+        loss = -torch.log(numerator / denominator).mean()
+        return loss
+
+    high_embs = []
+    low_embs = []
+    for i in range(ref_last_hiddens.shape[0]):
+        _last_hidden, _ref_hidden_flag, _ref_last_hiddens = last_hidden[i], ref_hidden_flag[i], ref_last_hiddens[i]
+        # cur_embs = get_embs(_last_hidden)
+        # ref_embs = get_embs(_ref_last_hiddens)
+        cur_embs = _last_hidden
+        ref_embs = _ref_last_hiddens
+        if _ref_hidden_flag > 0:
+            high_embs.append(cur_embs)
+            low_embs.append(ref_embs)
+        elif _ref_hidden_flag < 0:
+            high_embs.append(ref_embs)
+            low_embs.append(cur_embs)
+    high_embs = torch.stack(high_embs, dim=0).to(last_hidden.device)
+    low_embs = torch.stack(low_embs, dim=0).to(last_hidden.device)
+
+    cl_loss = forward_cl(high_embs, low_embs, progress)
+
+    separation = compute_separation_metrics(high_embs.to(torch.float32), low_embs.to(torch.float32))['separation']
+    lambda_c = 0.3 * torch.sigmoid(torch.tensor(5 * (0.5 - separation)))
+
+    return cl_loss, lambda_c
+
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -170,8 +269,11 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_hidden_states=True,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                last_hidden = output.hidden_states[-1].squeeze(0)
+                # print("====================", len(output.hidden_states))
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -209,6 +311,12 @@ class DataParallelPPOActor(BasePPOActor):
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
+                    last_hidden = gather_outputs_and_unpad(
+                        last_hidden,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
                     if calculate_entropy:
                         entropy_rmpad = gather_outputs_and_unpad(
                             entropy_rmpad,
@@ -230,44 +338,53 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
-
+                full_last_hidden = pad_input(
+                    hidden_states=last_hidden.unsqueeze(-1),
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
-            else:  # not using rmpad and no ulysses sp
-                extra_args = {}
-                if self.use_fused_kernels:
-                    extra_args["temperature"] = temperature
-                    extra_args["return_dict"] = True
+                last_hidden = full_last_hidden.squeeze(-1)               # (bsz, seq_length, hidden_size)
+                last_hidden = last_hidden[:, -response_length - 1 : -1, :]  # (bsz, response_length, hidden_size)
+                last_hidden = get_embs(last_hidden)                         # (bsz, hidden_size)
+            # else:  # not using rmpad and no ulysses sp
+            #     extra_args = {}
+            #     if self.use_fused_kernels:
+            #         extra_args["temperature"] = temperature
+            #         extra_args["return_dict"] = True
 
-                output = self.actor_module(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                    **extra_args,
-                )  # prevent model thinks we are generating
+            #     output = self.actor_module(
+            #         input_ids=input_ids,
+            #         attention_mask=attention_mask,
+            #         position_ids=position_ids,
+            #         **multi_modal_inputs,
+            #         use_cache=False,
+            #         # output_hidden_states=True,
+            #         **extra_args,
+            #     )  # prevent model thinks we are generating
 
-                if self.use_fused_kernels:
-                    log_probs = output.log_probs[:, -response_length - 1 : -1]
-                    entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+            #     if self.use_fused_kernels:
+            #         log_probs = output.log_probs[:, -response_length - 1 : -1]
+            #         entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
-                else:
-                    logits = output.logits
+            #     else:
+            #         logits = output.logits
 
-                    logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
-                    if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
-                            entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
-                        else:
-                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+            #         logits.div_(temperature)
+            #         logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+            #         log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+            #         if calculate_entropy:
+            #             if not self.config.entropy_checkpointing:
+            #                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+            #             else:
+            #                 entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+            return entropy, log_probs, last_hidden
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -325,28 +442,32 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches = data.split(micro_batch_size)
 
         log_probs_lst = []
+        last_hidden_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
+                entropy, log_probs, last_hidden = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
             log_probs_lst.append(log_probs)
+            last_hidden_lst.append(last_hidden)
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
+        last_hiddens = torch.concat(last_hidden_lst, dim=0)
+
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+            last_hiddens = restore_dynamic_batch(last_hiddens, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
-
-        return log_probs, entropys
+        return log_probs, entropys, last_hiddens
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -354,6 +475,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        global_step = data.meta_info["global_step"][0]
 
         select_keys = [
             "responses",
@@ -363,6 +485,9 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids",
             "old_log_probs",
             "advantages",
+            # "last_hiddens",
+            "ref_last_hiddens", 
+            "ref_hidden_flag",
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -381,7 +506,7 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    micro_batches, batch_idx_lists = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -390,12 +515,15 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_batch, batch_idx_list in zip(micro_batches, batch_idx_lists):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+                    # last_hiddens = model_inputs["last_hiddens"]
+                    ref_last_hiddens = model_inputs["ref_last_hiddens"]
+                    ref_hidden_flag = model_inputs["ref_hidden_flag"]
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = (
@@ -412,7 +540,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, last_hidden = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
@@ -449,6 +577,12 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
+
+                    if self.config.use_cl_loss:
+                        cl_loss, lambda_c = compute_cl_loss(last_hidden, ref_hidden_flag, ref_last_hiddens, progress=global_step/200)
+                        policy_loss = policy_loss + cl_loss * lambda_c
+                        micro_batch_metrics["actor/cl_loss"] = cl_loss.detach().item()
+                        micro_batch_metrics["actor/cl_coef"] = lambda_c.detach().item()
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]

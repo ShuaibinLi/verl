@@ -249,6 +249,7 @@ def compute_grpo_outcome_advantage(
     index: np.ndarray,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
+    last_hiddens: Optional = None,
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -280,32 +281,58 @@ def compute_grpo_outcome_advantage(
             shape is (bs, response_length)
     """
     scores = token_level_rewards.sum(dim=-1)
+    ref_last_hiddens = torch.zeros_like(last_hiddens)
+    ref_hidden_flag = torch.ones_like(scores)
 
     id2score = defaultdict(list)
+    id2scoreid = defaultdict(list)
     id2mean = {}
     id2std = {}
+    id2max = {}
+    id2min = {}
 
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
+            id2scoreid[index[i]].append(i)
+
         for idx in id2score:
             if len(id2score[idx]) == 1:
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
+                id2max[idx] = id2score[idx]
+                id2min[idx] = id2score[idx]
             elif len(id2score[idx]) > 1:
                 id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
                 id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+                id2max[idx] = torch.max(torch.tensor(id2score[idx]))
+                id2min[idx] = torch.min(torch.tensor(id2score[idx]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
+
+        id2maxscoreid = {}
+        id2minscoreid = {}
+
+        for key in id2score:
+            score_id_pairs = [(t.item(), sid) for t, sid in zip(id2score[key], id2scoreid[key])]
+            id2maxscoreid[key] = max(score_id_pairs, key=lambda x: x[0])[1]
+            id2minscoreid[key] = min(score_id_pairs, key=lambda x: x[0])[1]
+
         for i in range(bsz):
+            ref_hidden_flag[i] = (scores[i] - id2mean[index[i]]) * 1.0
+            if ref_hidden_flag[i] > 0:
+                ref_last_hiddens[i] = last_hiddens[id2maxscoreid[index[i]]]
+            elif ref_hidden_flag[i] < 0:
+                ref_last_hiddens[i] = last_hiddens[id2minscoreid[index[i]]]
+
             if norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
 
-    return scores, scores
+    return scores, scores, ref_last_hiddens, ref_hidden_flag
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
